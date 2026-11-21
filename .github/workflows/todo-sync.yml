@@ -24,11 +24,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Analyze TODOs
+      - name: Update README TODOs
         env:
-          APPLY: "false"
+          APPLY: "true"
         run: python3 .github/scripts/update_todo
-
-      - name: Show README diff
-        if: always()
-        run: git diff -- README.md || true
