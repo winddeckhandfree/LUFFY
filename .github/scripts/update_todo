@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Update README TODO entries for Python changes between main and dev."""
+import difflib
+import json
+import os
+import pathlib
+import re
+import subprocess
+
+ROOT = os.environ.get("GITHUB_WORKSPACE", ".")
+os.chdir(ROOT)
+
+TITLE = "### \U0001F4DD Complete TODO List"
+README = pathlib.Path("README.md")
+text = README.read_text(encoding="utf-8")
+lines = text.splitlines(keepends=True)
+
+try:
+    title_i = next(i for i, line in enumerate(lines) if line.strip() == TITLE)
+except StopIteration as exc:
+    raise SystemExit("Required README TODO title was not found") from exc
+
+next_h2 = next(
+    (i for i in range(title_i + 1, len(lines)) if lines[i].startswith("## ")),
+    len(lines),
+)
+head = "".join(lines[: title_i + 1])
+tail = "".join(lines[next_h2:])
+old_body = "".join(lines[title_i + 1 : next_h2])
+
+entry_re = re.compile(
+    r"^- \[ \] \*\*(?P<path>.+?):(?P<line>\d+)\*\* - (?P<text>.*)$"
+)
+base_entries = []
+for line in old_body.splitlines():
+    match = entry_re.match(line)
+    if not match:
+        continue
+    item = match.groupdict()
+    item["line"] = int(item["line"])
+    item["raw"] = line
+    base_entries.append(item)
+
+print("BASELINE_ENTRIES", len(base_entries))
+
+
+def todo_text(raw_line):
+    pos = raw_line.find("TODO")
+    suffix = raw_line[pos + 4 :]
+    suffix = re.sub(r"^\s*:?\s*", "", suffix)
+    return suffix.strip()
+
+
+def extract_todos(root):
+    root = pathlib.Path(root)
+    records = []
+    py_files = sorted(
+        path for path in root.rglob("*.py") if ".git" not in path.parts
+    )
+    for path in py_files:
+        rel_path = path.relative_to(root).as_posix()
+        try:
+            handle = path.open(encoding="utf-8")
+        except UnicodeDecodeError:
+            handle = path.open(encoding="latin-1")
+        with handle:
+            for lineno, raw_line in enumerate(handle, 1):
+                if "TODO" in raw_line:
+                    records.append(
+                        {
+                            "path": rel_path,
+                            "line": lineno,
+                            "text": todo_text(raw_line),
+                        }
+                    )
+    records.sort(key=lambda item: (item["path"], item["line"]))
+    return records
+
+
+def render(item):
+    return f"- [ ] **{item['path']}:{item['line']}** - {item['text']}"
+
+
+def key_of(item):
+    return item["path"], item["line"], item["text"]
+
+
+full_dev = extract_todos(".")
+print("FULL_DEV_TODO_RECORDS", len(full_dev))
+
+subprocess.run(
+    ["git", "fetch", "origin", "main"],
+    check=False,
+    capture_output=True,
+    text=True,
+)
+changed_output = subprocess.check_output(
+    ["git", "diff", "--name-only", "origin/main...HEAD"],
+    text=True,
+)
+changed_py = sorted(
+    path for path in changed_output.splitlines() if path.endswith(".py")
+)
+changed_set = set(changed_py)
+print("CHANGED_PY", json.dumps(changed_py, ensure_ascii=False))
+
+for path in changed_py:
+    file_path = pathlib.Path(path)
+    if not file_path.exists():
+        print("DELETED_PY", path)
+        continue
+    records = [item for item in full_dev if item["path"] == path]
+    print("CHANGED_FILE", path, "TODO_COUNT", len(records))
+    for item in records:
+        print(f"  {item['line']}: {item['text']!r}")
+
+kept = [dict(item) for item in base_entries if item["path"] not in changed_set]
+final = list(kept)
+for path in changed_py:
+    if pathlib.Path(path).exists():
+        final.extend(item for item in full_dev if item["path"] == path)
+final.sort(key=lambda item: (item["path"], item["line"]))
+
+raw_lookup = {key_of(item): item["raw"] for item in base_entries}
+output_lines = []
+for item in final:
+    key = key_of(item)
+    output_lines.append(raw_lookup.get(key, render(item)))
+
+new_body = "\n" + "\n".join(output_lines) + "\n\n"
+new_text = head + new_body + tail
+print("FINAL_ENTRIES", len(output_lines))
+
+full_keys = [key_of(item) for item in full_dev]
+final_keys = [key_of(item) for item in final]
+print("FULL_EQUALS_FINAL_KEYS", full_keys == final_keys)
+if full_keys != final_keys:
+    diff = difflib.unified_diff(
+        [f"{p}:{n}: {t}" for p, n, t in full_keys],
+        [f"{p}:{n}: {t}" for p, n, t in final_keys],
+        fromfile="full_dev",
+        tofile="minimal_update",
+        lineterm="",
+    )
+    print("FULL_VS_MINIMAL_DIFF_BEGIN")
+    print("\n".join(diff[:400]))
+    print("FULL_VS_MINIMAL_DIFF_END")
+
+worktree = "/tmp/luffy-main-check"
+try:
+    subprocess.run(["rm", "-rf", worktree], check=False)
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", worktree, "origin/main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    main_keys = [key_of(item) for item in extract_todos(worktree)]
+    baseline_keys = [key_of(item) for item in base_entries]
+    print("MAIN_EXTRACT_COUNT", len(main_keys), "README_COUNT", len(baseline_keys))
+    print("MAIN_EXTRACT_EQUALS_README", main_keys == baseline_keys)
+    if main_keys != baseline_keys:
+        diff = difflib.unified_diff(
+            [f"{p}:{n}: {t}" for p, n, t in main_keys],
+            [f"{p}:{n}: {t}" for p, n, t in baseline_keys],
+            fromfile="main_extract",
+            tofile="readme_baseline",
+            lineterm="",
+        )
+        print("MAIN_VS_README_DIFF_BEGIN")
+        print("\n".join(diff[:500]))
+        print("MAIN_VS_README_DIFF_END")
+except Exception as exc:
+    print("MAIN_CHECK_ERROR", repr(exc))
+
+if os.environ.get("APPLY") == "true":
+    if new_text != text:
+        README.write_text(new_text, encoding="utf-8")
+        print("README_WRITTEN")
+        subprocess.run(
+            ["git", "config", "user.name", "github-actions[bot]"], check=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "user.email",
+                "41898282+github-actions[bot]@users.noreply.github.com",
+            ],
+            check=True,
+        )
+        subprocess.run(["git", "add", "README.md"], check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "docs: update complete TODO list"],
+            check=True,
+        )
+        subprocess.run(["git", "push", "origin", "HEAD:dev"], check=True)
+        print("README_PUSHED")
+    else:
+        print("NO_README_CHANGES")
+else:
+    print("CHECK_ONLY_NO_WRITE")
